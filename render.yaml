@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: estrategia-scanner-backend
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: FOOTBALL_API_KEY
+        sync: false
+      - key: SCAN_INTERVAL_MS
+        value: 120000
