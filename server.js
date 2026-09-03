@@ -44,14 +44,26 @@ const footballApi = axios.create({
 const SCAN_INTERVAL_MS = parseInt(process.env.SCAN_INTERVAL_MS || '120000', 10); // 2 min
 
 // ============================================================================
+// CONFIG - TwelveData (https://twelvedata.com/) - cotações e indicadores de Forex
+// ============================================================================
+
+const TWELVEDATA_API_KEY = process.env.TWELVEDATA_API_KEY || '';
+const twelveDataApi = axios.create({
+    baseURL: 'https://api.twelvedata.com',
+    timeout: 15000
+});
+
+// ============================================================================
 // ESTADO EM MEMÓRIA (troque por um banco real se quiser persistência definitiva)
 // ============================================================================
 
-let strategies = [];   // estratégias criadas pelo usuário
-let signals = [];      // sinais/sugestões geradas pelo scanner
-let scanning = false;  // liga/desliga a varredura automática
+let strategies = [];       // estratégias de futebol criadas pelo usuário
+let forexStrategies = [];  // estratégias de Forex/Opção Binária criadas pelo usuário
+let signals = [];          // sinais/sugestões geradas pelo scanner (futebol + forex)
+let scanning = false;      // liga/desliga a varredura automática
 let lastScanAt = null;
 let scanErrors = [];
+const lastForexSignalAt = {}; // `${strategyId}` -> timestamp, evita spam de sinal
 
 // ============================================================================
 // MODELO DE ESTRATÉGIA
@@ -136,6 +148,72 @@ app.post('/api/strategies/:id/toggle', (req, res) => {
 });
 
 // ============================================================================
+// ROTAS - ESTRATÉGIAS DE FOREX / OPÇÃO BINÁRIA (CRUD)
+// ============================================================================
+// {
+//   id, name, active,
+//   asset,        // ex: 'EUR/USD'
+//   timeframe,    // '1min' | '5min' | '15min' | '1h'
+//   indicator,    // 'RSI' | 'EQUAL_CANDLES' | 'BIG_CANDLE' | 'GAP'
+//   operator,     // usado só no RSI: 'lte' (sobrevendido) | 'gte' (sobrecomprado)
+//   value         // RSI: nível (ex 30/70) | EQUAL_CANDLES: nº de velas (ex 3)
+//                 // BIG_CANDLE: múltiplo do corpo médio (ex 2.5) | GAP: % mínima do gap (ex 0.1)
+// }
+
+app.get('/api/forex-strategies', (req, res) => {
+    res.json(forexStrategies);
+});
+
+app.post('/api/forex-strategies', (req, res) => {
+    const { name, asset, timeframe, indicator, operator, value, active } = req.body;
+
+    if (!name || !asset) {
+        return res.status(400).json({ error: 'Nome e ativo são obrigatórios' });
+    }
+
+    const strategy = {
+        id: crypto.randomUUID(),
+        name,
+        active: active !== undefined ? !!active : true,
+        asset,
+        timeframe: timeframe || '5min',
+        indicator: indicator || 'RSI',
+        operator: operator || 'lte',
+        value: value !== undefined && value !== '' ? parseFloat(value) : (indicator === 'RSI' ? 30 : 2),
+        createdAt: new Date().toISOString()
+    };
+
+    forexStrategies.push(strategy);
+    console.log(`[✓] Estratégia Forex criada: ${strategy.name} (${strategy.asset})`);
+    res.json(strategy);
+});
+
+app.put('/api/forex-strategies/:id', (req, res) => {
+    const idx = forexStrategies.findIndex(s => s.id === req.params.id);
+    if (idx === -1) return res.status(404).json({ error: 'Estratégia não encontrada' });
+
+    const body = req.body;
+    forexStrategies[idx] = {
+        ...forexStrategies[idx],
+        ...body,
+        value: body.value !== undefined && body.value !== '' ? parseFloat(body.value) : forexStrategies[idx].value
+    };
+    res.json(forexStrategies[idx]);
+});
+
+app.delete('/api/forex-strategies/:id', (req, res) => {
+    forexStrategies = forexStrategies.filter(s => s.id !== req.params.id);
+    res.json({ success: true });
+});
+
+app.post('/api/forex-strategies/:id/toggle', (req, res) => {
+    const strat = forexStrategies.find(s => s.id === req.params.id);
+    if (!strat) return res.status(404).json({ error: 'Estratégia não encontrada' });
+    strat.active = !strat.active;
+    res.json(strat);
+});
+
+// ============================================================================
 // ROTAS - SCANNER (liga/desliga a varredura automática de jogos)
 // ============================================================================
 
@@ -144,15 +222,18 @@ app.get('/api/scanner/status', (req, res) => {
         scanning,
         lastScanAt,
         activeStrategies: strategies.filter(s => s.active).length,
+        activeForexStrategies: forexStrategies.filter(s => s.active).length,
         totalSignals: signals.length,
+        footballConfigured: !!FOOTBALL_API_KEY,
+        forexConfigured: !!TWELVEDATA_API_KEY,
         errors: scanErrors.slice(-5)
     });
 });
 
 app.post('/api/scanner/start', (req, res) => {
-    if (!FOOTBALL_API_KEY) {
+    if (!FOOTBALL_API_KEY && !TWELVEDATA_API_KEY) {
         return res.status(400).json({
-            error: 'FOOTBALL_API_KEY não configurada. Adicione no arquivo .env'
+            error: 'Nenhuma API configurada. Adicione FOOTBALL_API_KEY e/ou TWELVEDATA_API_KEY no .env'
         });
     }
     scanning = true;
@@ -337,9 +418,171 @@ async function runScan() {
     }
 }
 
+// ============================================================================
+// MOTOR DE VARREDURA - FOREX / OPÇÃO BINÁRIA (candles + indicadores)
+// ============================================================================
+// IMPORTANTE: isso é análise técnica sobre dados públicos de preço. Gera um
+// AVISO/sugestão — nunca executa nenhuma operação sozinho.
+
+async function fetchCandles(asset, timeframe, outputsize = 20) {
+    const { data } = await twelveDataApi.get('/time_series', {
+        params: {
+            symbol: asset,
+            interval: timeframe,
+            outputsize,
+            apikey: TWELVEDATA_API_KEY
+        }
+    });
+    if (data.status === 'error' || !data.values) {
+        throw new Error(data.message || 'Falha ao buscar candles');
+    }
+    // TwelveData retorna do mais recente para o mais antigo -> inverte para ordem cronológica
+    return data.values
+        .map(v => ({
+            datetime: v.datetime,
+            open: parseFloat(v.open),
+            high: parseFloat(v.high),
+            low: parseFloat(v.low),
+            close: parseFloat(v.close)
+        }))
+        .reverse();
+}
+
+function candleBody(c) { return Math.abs(c.close - c.open); }
+function isBullish(c) { return c.close > c.open; }
+
+async function fetchRSI(asset, timeframe) {
+    const { data } = await twelveDataApi.get('/rsi', {
+        params: { symbol: asset, interval: timeframe, time_period: 14, apikey: TWELVEDATA_API_KEY }
+    });
+    if (data.status === 'error' || !data.values) {
+        throw new Error(data.message || 'Falha ao buscar RSI');
+    }
+    return parseFloat(data.values[0].rsi); // valor mais recente
+}
+
+// Verifica se as últimas N velas são "iguais" (mesma cor e corpo parecido) -> sinal de exaustão/reversão
+function checkEqualCandles(candles, n) {
+    if (candles.length < n) return null;
+    const last = candles.slice(-n);
+    const sameColor = last.every(c => isBullish(c) === isBullish(last[0]));
+    if (!sameColor) return null;
+
+    const bodies = last.map(candleBody);
+    const avgBody = bodies.reduce((a, b) => a + b, 0) / bodies.length;
+    if (avgBody === 0) return null;
+    const uniform = bodies.every(b => Math.abs(b - avgBody) / avgBody <= 0.25); // corpos parecidos (±25%)
+    if (!uniform) return null;
+
+    // Reversão: aposta contra a sequência de velas iguais
+    return isBullish(last[0]) ? 'PUT' : 'CALL';
+}
+
+// Verifica se a última vela tem corpo muito maior que a média das anteriores -> rompimento/notícia
+function checkBigCandle(candles, multiplier) {
+    if (candles.length < 6) return null;
+    const last = candles[candles.length - 1];
+    const previous = candles.slice(-11, -1);
+    if (previous.length === 0) return null;
+
+    const avgBody = previous.reduce((sum, c) => sum + candleBody(c), 0) / previous.length;
+    if (avgBody === 0) return null;
+
+    const lastBody = candleBody(last);
+    if (lastBody < avgBody * multiplier) return null;
+
+    // Sugere seguir a direção da vela de rompimento
+    return isBullish(last) ? 'CALL' : 'PUT';
+}
+
+// Verifica gap entre o fechamento anterior e a abertura da vela atual
+function checkGap(candles, minPercent) {
+    if (candles.length < 2) return null;
+    const prev = candles[candles.length - 2];
+    const cur = candles[candles.length - 1];
+    const gapPercent = ((cur.open - prev.close) / prev.close) * 100;
+    if (Math.abs(gapPercent) < minPercent) return null;
+    return gapPercent > 0 ? 'CALL' : 'PUT';
+}
+
+async function evaluateForexStrategy(strategy) {
+    if (strategy.indicator === 'RSI') {
+        const rsi = await fetchRSI(strategy.asset, strategy.timeframe);
+        const hit = strategy.operator === 'gte' ? rsi >= strategy.value : rsi <= strategy.value;
+        if (!hit) return null;
+        return {
+            direction: strategy.operator === 'lte' ? 'CALL' : 'PUT', // sobrevendido->compra, sobrecomprado->venda
+            detail: `RSI(14) em ${rsi.toFixed(1)}`
+        };
+    }
+
+    const candles = await fetchCandles(strategy.asset, strategy.timeframe, 20);
+
+    if (strategy.indicator === 'EQUAL_CANDLES') {
+        const direction = checkEqualCandles(candles, Math.max(2, Math.round(strategy.value)));
+        if (!direction) return null;
+        return { direction, detail: `${Math.round(strategy.value)} velas iguais seguidas` };
+    }
+
+    if (strategy.indicator === 'BIG_CANDLE') {
+        const direction = checkBigCandle(candles, strategy.value);
+        if (!direction) return null;
+        return { direction, detail: `Vela com corpo ${strategy.value}x maior que a média` };
+    }
+
+    if (strategy.indicator === 'GAP') {
+        const direction = checkGap(candles, strategy.value);
+        if (!direction) return null;
+        return { direction, detail: `Gap de abertura >= ${strategy.value}%` };
+    }
+
+    return null;
+}
+
+async function runForexScan() {
+    if (!TWELVEDATA_API_KEY) return;
+
+    const activeStrategies = forexStrategies.filter(s => s.active);
+    const cooldownMs = 15 * 60 * 1000; // 15 min entre sinais repetidos da mesma estratégia
+
+    for (const strategy of activeStrategies) {
+        try {
+            const last = lastForexSignalAt[strategy.id];
+            if (last && Date.now() - last < cooldownMs) continue;
+
+            const result = await evaluateForexStrategy(strategy);
+            if (!result) continue;
+
+            const signal = {
+                id: crypto.randomUUID(),
+                market: 'forex',
+                strategyId: strategy.id,
+                strategyName: strategy.name,
+                asset: strategy.asset,
+                timeframe: strategy.timeframe,
+                indicator: strategy.indicator,
+                direction: result.direction, // 'CALL' | 'PUT'
+                detail: result.detail,
+                createdAt: new Date().toISOString()
+            };
+
+            signals.push(signal);
+            lastForexSignalAt[strategy.id] = Date.now();
+            console.log(`[⚡] Sinal Forex: ${signal.asset} -> ${signal.direction} (${signal.detail}) [${strategy.name}]`);
+        } catch (err) {
+            const message = err.response?.data?.message || err.message;
+            console.error(`[✗] Erro avaliando estratégia forex "${strategy.name}":`, message);
+            scanErrors.push({ message: `Forex/${strategy.name}: ${message}`, at: new Date().toISOString() });
+        }
+    }
+}
+
 // Loop de varredura
 setInterval(() => {
-    if (scanning) runScan();
+    if (scanning) {
+        runScan();
+        runForexScan();
+    }
 }, SCAN_INTERVAL_MS);
 
 // ============================================================================
