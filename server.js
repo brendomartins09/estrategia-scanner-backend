@@ -20,8 +20,10 @@ const cors = require('cors');
 require('dotenv').config();
 const axios = require('axios');
 const crypto = require('crypto');
+const { Expo } = require('expo-server-sdk');
 
 const app = express();
+const expo = new Expo();
 const PORT = process.env.PORT || 5000;
 
 app.use(cors());
@@ -63,7 +65,58 @@ let signals = [];          // sinais/sugestões geradas pelo scanner (futebol + 
 let scanning = false;      // liga/desliga a varredura automática
 let lastScanAt = null;
 let scanErrors = [];
+let pushTokens = [];   // tokens de push Expo dos celulares registrados
 const lastForexSignalAt = {}; // `${strategyId}` -> timestamp, evita spam de sinal
+
+// ============================================================================
+// PUSH NOTIFICATIONS (Expo)
+// ============================================================================
+
+async function sendPushForSignal(signal) {
+    const messages = [];
+    for (const token of pushTokens) {
+        if (!Expo.isExpoPushToken(token)) continue;
+
+        const title = signal.market === 'forex'
+            ? `${signal.direction === 'CALL' ? '📈' : '📉'} ${signal.asset} — ${signal.direction}`
+            : `⚡ ${signal.homeTeam} x ${signal.awayTeam}`;
+
+        const body = signal.market === 'forex'
+            ? `${signal.strategyName} · ${signal.detail}`
+            : `${signal.strategyName} · ${signal.selectionLabel} @ ${signal.odd}`;
+
+        messages.push({ to: token, sound: 'default', title, body, data: { signal } });
+    }
+    if (messages.length === 0) return;
+
+    const chunks = expo.chunkPushNotifications(messages);
+    for (const chunk of chunks) {
+        try {
+            const tickets = await expo.sendPushNotificationsAsync(chunk);
+            // Remove tokens que o Expo reporta como inválidos/desinstalados
+            tickets.forEach((ticket, i) => {
+                if (ticket.status === 'error' && ticket.details?.error === 'DeviceNotRegistered') {
+                    const badToken = chunk[i].to;
+                    pushTokens = pushTokens.filter(t => t !== badToken);
+                }
+            });
+        } catch (e) {
+            console.error('Erro enviando push:', e.message);
+        }
+    }
+}
+
+app.post('/api/push-token', (req, res) => {
+    const { token } = req.body;
+    if (!token || !Expo.isExpoPushToken(token)) {
+        return res.status(400).json({ error: 'Token de push inválido' });
+    }
+    if (!pushTokens.includes(token)) {
+        pushTokens.push(token);
+        console.log(`[✓] Token de push registrado (${pushTokens.length} total)`);
+    }
+    res.json({ success: true });
+});
 
 // ============================================================================
 // MODELO DE ESTRATÉGIA
@@ -407,6 +460,7 @@ async function runScan() {
 
                 signals.push(signal);
                 console.log(`[⚡] Sinal: ${signal.homeTeam} x ${signal.awayTeam} -> ${signal.selectionLabel} @ ${signal.odd} (${strategy.name})`);
+                sendPushForSignal(signal);
             }
         }
 
@@ -569,6 +623,7 @@ async function runForexScan() {
             signals.push(signal);
             lastForexSignalAt[strategy.id] = Date.now();
             console.log(`[⚡] Sinal Forex: ${signal.asset} -> ${signal.direction} (${signal.detail}) [${strategy.name}]`);
+            sendPushForSignal(signal);
         } catch (err) {
             const message = err.response?.data?.message || err.message;
             console.error(`[✗] Erro avaliando estratégia forex "${strategy.name}":`, message);
